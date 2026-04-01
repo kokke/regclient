@@ -727,6 +727,31 @@ func (opts *rootOpts) processRef(ctx context.Context, s ConfigSync, src, tgt ref
 			slog.String("source", src.CommonName()),
 			slog.String("target", tgt.CommonName()))
 	}
+	// enforce minimum age if set in config
+	if s.MinAge > 0 {
+		conf, err := opts.rc.ImageConfig(ctx, src)
+		if err != nil {
+			opts.log.Warn("Skipping image, failed to retrieve image config for minAge check",
+				slog.String("source", src.CommonName()),
+				slog.String("error", err.Error()))
+			return nil
+		}
+		img := conf.GetConfig()
+		if img.Created == nil || img.Created.IsZero() {
+			opts.log.Warn("Skipping image, no creation timestamp",
+				slog.String("source", src.CommonName()))
+			return nil
+		}
+		age := time.Since(*img.Created)
+		if age < s.MinAge {
+			opts.log.Info("Skipping image, too new",
+				slog.String("source", src.CommonName()),
+				slog.Duration("age", age),
+				slog.Duration("minAge", s.MinAge))
+			return nil
+		}
+	}
+
 	if action == actionCheck {
 		return nil
 	}

@@ -12,6 +12,7 @@ defaults:
   parallel: 2
   interval: 60m
   backup: "bkup-{{.Ref.Tag}}"
+  minAge: 72h
 sync:
   - source: busybox:latest
     target: registry:5000/library/busybox:latest
