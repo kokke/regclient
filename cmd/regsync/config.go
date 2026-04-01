@@ -49,6 +49,9 @@ type ConfigDefaults struct {
 	IncludeExternal *bool                  `yaml:"includeExternal" json:"includeExternal"`
 	MediaTypes      []string               `yaml:"mediaTypes" json:"mediaTypes"`
 	Hooks           ConfigHooks            `yaml:"hooks" json:"hooks"`
+	MinAge          time.Duration          `yaml:"minAge" json:"minAge"`
+	MinAgeSource    string                 `yaml:"minAgeSource" json:"minAgeSource"`
+	FirstSeenFile   string                 `yaml:"firstSeenFile" json:"firstSeenFile"`
 	// general options
 	BlobLimit      int64         `yaml:"blobLimit" json:"blobLimit"`
 	CacheCount     int           `yaml:"cacheCount" json:"cacheCount"`
@@ -87,6 +90,9 @@ type ConfigSync struct {
 	RateLimit       ConfigRateLimit        `yaml:"ratelimit" json:"ratelimit"`
 	MediaTypes      []string               `yaml:"mediaTypes" json:"mediaTypes"`
 	Hooks           ConfigHooks            `yaml:"hooks" json:"hooks"`
+	MinAge          time.Duration          `yaml:"minAge" json:"minAge"`
+	MinAgeSource    string                 `yaml:"minAgeSource" json:"minAgeSource"`
+	FirstSeenFile   string                 `yaml:"firstSeenFile" json:"firstSeenFile"`
 }
 
 // RepoAllowDeny is an allow and deny list of regex strings for repository names
@@ -312,5 +318,14 @@ func syncSetDefaults(s *ConfigSync, d ConfigDefaults) {
 	}
 	if s.Hooks.Unchanged == nil && d.Hooks.Unchanged != nil {
 		s.Hooks.Unchanged = d.Hooks.Unchanged
+	}
+	if s.MinAge == 0 {
+		s.MinAge = d.MinAge
+	}
+	if s.MinAgeSource == "" && d.MinAgeSource != "" {
+		s.MinAgeSource = d.MinAgeSource
+	}
+	if s.FirstSeenFile == "" && d.FirstSeenFile != "" {
+		s.FirstSeenFile = d.FirstSeenFile
 	}
 }

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -23,6 +26,7 @@ import (
 	"github.com/regclient/regclient"
 	"github.com/regclient/regclient/config"
 	"github.com/regclient/regclient/internal/cobradoc"
+	"github.com/regclient/regclient/internal/conffile"
 	"github.com/regclient/regclient/internal/pqueue"
 	"github.com/regclient/regclient/internal/semver"
 	"github.com/regclient/regclient/internal/version"
@@ -40,6 +44,10 @@ import (
 const (
 	// UserAgent sets the header on http requests
 	UserAgent = "regclient/regsync"
+	// minAgeSourceCreated uses the image's Created timestamp to measure age.
+	minAgeSourceCreated = "created"
+	// minAgeSourceFirstSeen uses regsync's own first-seen timestamp, immune to spoofed Created fields.
+	minAgeSourceFirstSeen = "firstSeen"
 )
 
 type actionType int
@@ -54,17 +62,24 @@ const (
 // This is separate from the concurrency limits in regclient itself.
 type throttle struct{}
 
+// firstSeenEntry records when a digest was first observed by regsync.
+type firstSeenEntry struct {
+	FirstSeen time.Time `json:"firstSeen"`
+}
+
 type rootOpts struct {
-	confFile   string
-	verbosity  string
-	logopts    []string
-	log        *slog.Logger
-	format     string // for Go template formatting of various commands
-	abortOnErr bool
-	missing    bool
-	conf       *Config
-	rc         *regclient.RegClient
-	throttle   *pqueue.Queue[throttle]
+	confFile       string
+	verbosity      string
+	logopts        []string
+	log            *slog.Logger
+	format         string // for Go template formatting of various commands
+	abortOnErr     bool
+	missing        bool
+	conf           *Config
+	rc             *regclient.RegClient
+	throttle       *pqueue.Queue[throttle]
+	firstSeenFiles map[string]map[string]firstSeenEntry // file path → digest → entry
+	firstSeenMu    sync.RWMutex
 }
 
 func NewRootCmd() (*cobra.Command, *rootOpts) {
@@ -233,6 +248,9 @@ func (opts *rootOpts) runOnce(cmd *cobra.Command, args []string) error {
 		}
 	}
 	wg.Wait()
+	if err := opts.saveFirstSeen(); err != nil {
+		opts.log.Warn("Failed to save firstSeenFile", slog.String("error", err.Error()))
+	}
 	return errors.Join(errs...)
 }
 
@@ -276,6 +294,9 @@ func (opts *rootOpts) runServer(cmd *cobra.Command, args []string) error {
 					mu.Lock()
 					errs = append(errs, err)
 					mu.Unlock()
+				}
+				if err := opts.saveFirstSeen(); err != nil {
+					opts.log.Warn("Failed to save firstSeenFile", slog.String("error", err.Error()))
 				}
 			})
 			if err != nil {
@@ -356,6 +377,9 @@ func (opts *rootOpts) runCheck(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+	if err := opts.saveFirstSeen(); err != nil {
+		opts.log.Warn("Failed to save firstSeenFile", slog.String("error", err.Error()))
+	}
 	return errors.Join(errs...)
 }
 
@@ -422,7 +446,82 @@ func (opts *rootOpts) loadConf() error {
 		rcOpts = append(rcOpts, regclient.WithConfigHost(rcHosts...))
 	}
 	opts.rc = regclient.New(rcOpts...)
+	// for each sync entry using firstSeen mode, resolve the file path (setting a
+	// default when not explicitly configured) then load all unique files into memory.
+	opts.firstSeenFiles = map[string]map[string]firstSeenEntry{}
+	loaded := map[string]bool{}
+	for i := range opts.conf.Sync {
+		s := &opts.conf.Sync[i]
+		if s.MinAgeSource != minAgeSourceFirstSeen {
+			continue
+		}
+		if s.FirstSeenFile == "" {
+			s.FirstSeenFile = defaultFirstSeenFile(opts.confFile)
+		}
+		if loaded[s.FirstSeenFile] {
+			continue
+		}
+		loaded[s.FirstSeenFile] = true
+		m := map[string]firstSeenEntry{}
+		data, err := os.ReadFile(s.FirstSeenFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to read firstSeenFile %q: %w", s.FirstSeenFile, err)
+		}
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, &m); err != nil {
+				return fmt.Errorf("failed to parse firstSeenFile %q: %w", s.FirstSeenFile, err)
+			}
+		}
+		opts.firstSeenFiles[s.FirstSeenFile] = m
+	}
 	return nil
+}
+
+// defaultFirstSeenFile derives a default first-seen sidecar filename from the
+// config file path. E.g. "regsync.yml" → "regsync-first-seen.json".
+func defaultFirstSeenFile(confFile string) string {
+	if confFile == "" || confFile == "-" {
+		return "regsync-first-seen.json"
+	}
+	ext := filepath.Ext(confFile)
+	return strings.TrimSuffix(confFile, ext) + "-first-seen.json"
+}
+
+// saveFirstSeen prunes stale entries and atomically writes each first-seen file to disk.
+func (opts *rootOpts) saveFirstSeen() error {
+	if len(opts.firstSeenFiles) == 0 {
+		return nil
+	}
+	// compute the longest minAge per file path for pruning
+	maxMinAgePerFile := map[string]time.Duration{}
+	for _, s := range opts.conf.Sync {
+		if s.FirstSeenFile != "" && s.MinAge > maxMinAgePerFile[s.FirstSeenFile] {
+			maxMinAgePerFile[s.FirstSeenFile] = s.MinAge
+		}
+	}
+	opts.firstSeenMu.Lock()
+	defer opts.firstSeenMu.Unlock()
+	var errs []error
+	for filePath, m := range opts.firstSeenFiles {
+		if maxMinAge := maxMinAgePerFile[filePath]; maxMinAge > 0 {
+			cutoff := time.Now().Add(-maxMinAge)
+			for k, v := range m {
+				if v.FirstSeen.Before(cutoff) {
+					delete(m, k)
+				}
+			}
+		}
+		data, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to marshal firstSeen for %q: %w", filePath, err))
+			continue
+		}
+		cf := conffile.New(conffile.WithFullname(filePath))
+		if err := cf.Write(bytes.NewReader(data)); err != nil {
+			errs = append(errs, fmt.Errorf("failed to write firstSeenFile %q: %w", filePath, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // process a sync step
@@ -726,6 +825,63 @@ func (opts *rootOpts) processRef(ctx context.Context, s ConfigSync, src, tgt ref
 		opts.log.Info("Image sync needed",
 			slog.String("source", src.CommonName()),
 			slog.String("target", tgt.CommonName()))
+	}
+	// enforce minimum age if set in config
+	if s.MinAge > 0 {
+		if s.MinAgeSource == minAgeSourceFirstSeen {
+			// first-seen mode: use our own timestamp, immune to spoofed Created fields
+			dgst := manifest.GetDigest(mSrc).String()
+			fileMap := opts.firstSeenFiles[s.FirstSeenFile]
+			opts.firstSeenMu.RLock()
+			entry, found := fileMap[dgst]
+			opts.firstSeenMu.RUnlock()
+			if !found {
+				opts.firstSeenMu.Lock()
+				// re-check under write lock to avoid a race between RUnlock and Lock
+				if _, exists := fileMap[dgst]; !exists {
+					fileMap[dgst] = firstSeenEntry{FirstSeen: time.Now()}
+				}
+				entry = fileMap[dgst]
+				opts.firstSeenMu.Unlock()
+				opts.log.Info("Recording first-seen, skipping image until minAge is reached",
+					slog.String("source", src.CommonName()),
+					slog.String("digest", dgst),
+					slog.Duration("minAge", s.MinAge))
+				return nil
+			}
+			age := time.Since(entry.FirstSeen)
+			if age < s.MinAge {
+				opts.log.Info("Skipping image, too new (first seen)",
+					slog.String("source", src.CommonName()),
+					slog.String("digest", dgst),
+					slog.Duration("age", age),
+					slog.Duration("minAge", s.MinAge))
+				return nil
+			}
+		} else {
+			// created mode (default): use the Created timestamp from the image config
+			conf, err := opts.rc.ImageConfig(ctx, src)
+			if err != nil {
+				opts.log.Warn("Skipping image, failed to retrieve image config for minAge check",
+					slog.String("source", src.CommonName()),
+					slog.String("error", err.Error()))
+				return nil
+			}
+			img := conf.GetConfig()
+			if img.Created == nil || img.Created.IsZero() {
+				opts.log.Warn("Skipping image, no creation timestamp",
+					slog.String("source", src.CommonName()))
+				return nil
+			}
+			age := time.Since(*img.Created)
+			if age < s.MinAge {
+				opts.log.Info("Skipping image, too new",
+					slog.String("source", src.CommonName()),
+					slog.Duration("age", age),
+					slog.Duration("minAge", s.MinAge))
+				return nil
+			}
+		}
 	}
 	if action == actionCheck {
 		return nil

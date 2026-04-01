@@ -12,6 +12,19 @@ defaults:
   parallel: 2
   interval: 60m
   backup: "bkup-{{.Ref.Tag}}"
+  minAge: 72h
+  # minAgeSource controls how image age is measured. Options:
+  #   created   (default) - use the Created timestamp embedded in the image config.
+  #                         Simple, but can be spoofed by the image builder.
+  #   firstSeen           - use the time regsync first observed the image digest.
+  #                         Immune to spoofed timestamps; requires a sidecar JSON file.
+  # minAgeSource: firstSeen
+  #
+  # firstSeenFile is the path to the sidecar JSON file used by minAgeSource: firstSeen.
+  # When minAgeSource is firstSeen and this is not set, a default path is derived
+  # from the config filename (e.g. regsync.yml -> regsync-first-seen.json).
+  # Can be overridden per sync entry to use separate files per registry.
+  # firstSeenFile: /var/lib/regsync/first-seen.json
 sync:
   - source: busybox:latest
     target: registry:5000/library/busybox:latest
